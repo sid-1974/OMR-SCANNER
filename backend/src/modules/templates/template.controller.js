@@ -3,6 +3,10 @@ const Template = require('./templateGroup.model');
 const OMRTemplate = require('./omrTemplate.model');
 // Note: We need AnswerKey here to populate answer keys in getTemplates
 const AnswerKey = require('../evaluation/answerKey.model');
+const ScannedSheet = require('../scans/scan.model');
+const EvaluationResult = require('../evaluation/evaluationResult.model');
+const StudentResponse = require('../evaluation/studentResponse.model');
+const Image = require('../images/image.model');
 const { successResponse, errorResponse } = require('../../common/utils/apiResponse');
 const { saveImageToDB } = require('../images/image.controller');
 
@@ -149,20 +153,52 @@ const deleteTemplate = async (req, res, next) => {
 
     const parentId = existing.template_id;
 
-    // Delete the template design
-    await OMRTemplate.findByIdAndDelete(id);
-
-    // Delete associated answer keys
+    // 1. Delete associated AnswerKeys
     await AnswerKey.deleteMany({ template_id: id });
 
-    // Check if the parent group has any other designs left
+    // 2. Find all ScannedSheets associated with this template
+    const scans = await ScannedSheet.find({ template_id: id });
+    const omrIds = scans.map(s => s.omr_id).filter(Boolean);
+
+    // 3. Delete EvaluationResults and StudentResponses
+    if (omrIds.length > 0) {
+      await EvaluationResult.deleteMany({ omr_id: { $in: omrIds } });
+      await StudentResponse.deleteMany({ omr_id: { $in: omrIds } });
+    }
+
+    // 4. Delete images from DB
+    const imageIdsToDelete = [];
+    if (existing.blank_image_path && existing.blank_image_path.startsWith('images/')) {
+      imageIdsToDelete.push(existing.blank_image_path.replace('images/', ''));
+    }
+    scans.forEach(scan => {
+      if (scan.raw_image_path && scan.raw_image_path.startsWith('images/')) {
+        imageIdsToDelete.push(scan.raw_image_path.replace('images/', ''));
+      }
+      if (scan.aligned_image_path && scan.aligned_image_path.startsWith('images/')) {
+        imageIdsToDelete.push(scan.aligned_image_path.replace('images/', ''));
+      }
+    });
+
+    const validImageIds = imageIdsToDelete.filter(imgId => mongoose.Types.ObjectId.isValid(imgId));
+    if (validImageIds.length > 0) {
+      await Image.deleteMany({ _id: { $in: validImageIds } });
+    }
+
+    // 5. Delete ScannedSheets
+    await ScannedSheet.deleteMany({ template_id: id });
+
+    // 6. Delete the template design
+    await OMRTemplate.findByIdAndDelete(id);
+
+    // 7. Check if the parent group has any other designs left
     const remainingDesigns = await OMRTemplate.countDocuments({ template_id: parentId });
     if (remainingDesigns === 0) {
       // Clean up the parent group if it has no more child designs
       await Template.findByIdAndDelete(parentId);
     }
 
-    return successResponse(res, 200, 'Template deleted successfully.');
+    return successResponse(res, 200, 'Template and all associated data deleted successfully.');
   } catch (error) {
     next(error);
   }
