@@ -30,6 +30,7 @@ const OMRScanConsole = ({ onEvaluationComplete }) => {
   const [reviewingIndex, setReviewingIndex] = useState(null);
   const [reviewData, setReviewData] = useState(null);
   const [showFullImage, setShowFullImage] = useState(false);
+  const [scanCompleteMsg, setScanCompleteMsg] = useState(null);
   const [isSavingAll, setIsSavingAll] = useState(false);
   const [saveProgress, setSaveProgress] = useState(0);
 
@@ -374,7 +375,10 @@ const OMRScanConsole = ({ onEvaluationComplete }) => {
 
         if (!alignedBlob) {
           // Load image on temporary canvas
-          const img = await loadImage(URL.createObjectURL(item.file));
+          const objectUrl = URL.createObjectURL(item.file);
+          const img = await loadImage(objectUrl);
+          URL.revokeObjectURL(objectUrl); // Prevent memory leak
+
           const canvas = rawCanvasRef.current;
           canvas.width = img.width;
           canvas.height = img.height;
@@ -410,19 +414,16 @@ const OMRScanConsole = ({ onEvaluationComplete }) => {
             anchors: templateAnchors
           });
 
-          // Convert to blob and dataUrl
+          // Convert to blob (needed for backend upload)
           alignedBlob = await getCanvasBlob(warpedCanvas);
-          const alignedDataUrl = warpedCanvas.toDataURL('image/jpeg', 0.9);
 
-          updateFileItem(idx, {
-            alignedBlob,
-            alignedDataUrl
-          });
+          // We do NOT store alignedDataUrl in state here to save memory. 
+          // We will generate it only if the sheet is flagged for review.
 
           // Run scan algorithm on the warped canvas
           scanResults = processAlignedOMR(warpedCanvas, selectedTemplate);
         } else {
-          // Already aligned, parse from dataUrl or canvas
+          // Already aligned manually, parse from dataUrl or canvas
           const img = await loadImage(item.alignedDataUrl);
           const canvas = warpedCanvasRef.current;
           canvas.width = selectedTemplate.width;
@@ -577,14 +578,33 @@ const OMRScanConsole = ({ onEvaluationComplete }) => {
           return;
         }
 
-        // Defer saving to backend until 'Done Scanning' is clicked
-        updateFileItem(idx, {
-          status: 'completed',
-          studentRegno: scanResults.student_regno,
-          sheetNumber: scanResults.sheet_number,
-          pattern: item.pattern || 'A',
-          results: scanResults
-        });
+        // Save immediately to database
+        try {
+          await saveResponsesToBackend(
+            sheetId,
+            scanResults.student_regno,
+            scanResults.sheet_number,
+            scanResults.qpcode,
+            scanResults.responses,
+            alignedBlob,
+            item.pattern || 'A'
+          );
+          updateFileItem(idx, {
+            status: 'completed',
+            studentRegno: scanResults.student_regno,
+            sheetNumber: scanResults.sheet_number,
+            pattern: item.pattern || 'A',
+            results: scanResults,
+            savedToBackend: true,
+            // Free up memory!
+            file: null,
+            alignedBlob: null,
+            alignedDataUrl: null
+          });
+        } catch (saveErr) {
+          console.error(`Failed to save sheet ${scanResults.sheet_number}:`, saveErr);
+          updateFileItem(idx, { status: 'failed', error: 'Save Failed: ' + saveErr.message });
+        }
 
         // Continue queue
         setProcessingIndex(idx + 1);
@@ -622,38 +642,25 @@ const OMRScanConsole = ({ onEvaluationComplete }) => {
   };
 
   const handleDoneScanning = async () => {
-    const completedFiles = files.filter(f => f.status === 'completed' && !f.savedToBackend);
-    if (completedFiles.length === 0) {
-      if (onEvaluationComplete) onEvaluationComplete();
-      return;
+    const totalCompleted = files.filter(f => f.status === 'completed').length;
+    
+    if (totalCompleted > 0) {
+      alert(`Successfully scanned and saved ${totalCompleted} sheet(s)!`);
+    } else {
+      alert("Finished scanning, but no sheets were successfully processed.");
     }
+    
+    // Soft reset the scanner state
+    setFiles([]);
+    setProcessingIndex(null);
+    setIsProcessing(false);
+    setScanMode(null);
+    setAligningIndex(null);
+    setReviewingIndex(null);
+    setReviewData(null);
+    setShowFullImage(false);
 
-    setIsSavingAll(true);
-    setSaveProgress(0);
-
-    for (let i = 0; i < completedFiles.length; i++) {
-      const item = completedFiles[i];
-      try {
-        await saveResponsesToBackend(
-          item.scannedSheetId,
-          item.studentRegno,
-          item.sheetNumber,
-          item.results?.qpcode,
-          item.results?.responses,
-          item.alignedBlob,
-          item.pattern || 'A'
-        );
-        const fileIndex = files.findIndex(f => f === item);
-        if (fileIndex !== -1) {
-          updateFileItem(fileIndex, { savedToBackend: true });
-        }
-      } catch (err) {
-        console.error(`Failed to save sheet ${item.sheetNumber}:`, err);
-      }
-      setSaveProgress(Math.round(((i + 1) / completedFiles.length) * 100));
-    }
-
-    setIsSavingAll(false);
+    // Navigate to Results Dashboard
     if (onEvaluationComplete) onEvaluationComplete();
   };
 
@@ -854,7 +861,17 @@ const OMRScanConsole = ({ onEvaluationComplete }) => {
     const item = files[idx];
 
     try {
-      // Defer saving to backend until 'Done Scanning' is clicked
+      // Save immediately to backend
+      await saveResponsesToBackend(
+        item.scannedSheetId,
+        reviewData.studentRegno,
+        reviewData.sheetNumber,
+        reviewData.qpcode,
+        reviewData.responses,
+        item.alignedBlob,
+        reviewData.pattern || 'A'
+      );
+
       updateFileItem(idx, {
         status: 'completed',
         studentRegno: reviewData.studentRegno,
@@ -865,7 +882,12 @@ const OMRScanConsole = ({ onEvaluationComplete }) => {
           student_regno: reviewData.studentRegno,
           sheet_number: reviewData.sheetNumber,
           responses: reviewData.responses
-        }
+        },
+        savedToBackend: true,
+        // Free up memory!
+        file: null,
+        alignedBlob: null,
+        alignedDataUrl: null
       });
 
       setReviewingIndex(null);
@@ -1089,23 +1111,14 @@ const OMRScanConsole = ({ onEvaluationComplete }) => {
                     <CheckSquare size={16} /> Manual Approval
                   </button>
                 </div>
-                {isSavingAll ? (
-                  <div style={{ padding: '0.75rem', background: 'rgba(255,255,255,0.05)', borderRadius: '6px' }}>
-                    <p style={{ fontSize: '0.85rem', marginBottom: '0.5rem', textAlign: 'center' }}>Saving Results to Database: {saveProgress}%</p>
-                    <div style={{ width: '100%', height: '8px', background: 'var(--bg-tertiary)', borderRadius: '4px', overflow: 'hidden' }}>
-                      <div style={{ width: `${saveProgress}%`, height: '100%', background: 'var(--accent-secondary)', transition: 'width 0.2s' }}></div>
-                    </div>
-                  </div>
-                ) : (
-                  <button
-                    className="btn btn-success"
-                    style={{ width: '100%', padding: '0.75rem', fontWeight: 600 }}
-                    onClick={handleDoneScanning}
-                    disabled={files.length === 0}
-                  >
-                    Done Scanning &rarr; View Results
-                  </button>
-                )}
+                <button
+                  className="btn btn-success"
+                  style={{ width: '100%', padding: '0.75rem', fontWeight: 600 }}
+                  onClick={handleDoneScanning}
+                  disabled={files.length === 0}
+                >
+                  Done Scanning &rarr; View Results
+                </button>
               </div>
             )}
           </div>
@@ -1113,6 +1126,13 @@ const OMRScanConsole = ({ onEvaluationComplete }) => {
           {/* Queue List Card */}
           <div className="glass-card" style={{ display: 'flex', flexDirection: 'column', gap: '1rem', height: 'calc(100vh - 140px)', overflowY: 'auto' }}>
             <h3 style={{ fontSize: '1rem', fontWeight: 600, color: 'var(--text-secondary)' }}>Scans Queue ({files.length} sheets)</h3>
+
+            {scanCompleteMsg && (
+              <div style={{ padding: '1rem', background: 'rgba(16, 185, 129, 0.1)', border: '1px solid var(--success)', borderRadius: '8px', color: 'var(--success)', display: 'flex', alignItems: 'center', gap: '0.75rem', fontWeight: 600 }}>
+                <CheckCircle size={20} />
+                {scanCompleteMsg}
+              </div>
+            )}
 
             {files.length === 0 ? (
               <div style={{ display: 'flex', flex: 1, alignItems: 'center', justifyContent: 'center', color: 'var(--text-muted)', fontSize: '0.9rem' }}>
